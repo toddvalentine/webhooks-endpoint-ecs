@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a service on AWS Fargate, hosted in a public subnet of a VPC, and accessible via a public load balancer
+
+# Input Paramters
+Parameters:
+  ServiceName:
+    Type: String
+    Default: webhooks-endpoint
+    Description: Name of the ECS service
+  AppImageUrl:
+    Type: String
+    Default: ''
+    Description: The url of a docker image that contains the application process that will handle the traffic for this service
+  ProxyImageUrl:
+    Type: String
+    Default: ''
+    Description: The url of a docker image that contains the application process that will handle the traffic for this service    
+  AppPort:
+    Type: Number
+    Default: 9000
+    Description: Port exposed by the proxy container that receieves traffic from the proxy
+  ProxyPort:
+    Type: Number
+    Default: 80
+    Description: Port exposed by the proxy container that receieves traffic from the lb  
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How much CPU to give the container. 1024 is 1 CPU
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: How much memory in megabytes to give the container
+  Path:
+    Type: String
+    Default: "*"
+    Description: A path on the public load balancer that this service should be connected to. Use * to send all load balancer traffic to this service.
+  Priority:
+    Type: Number
+    Default: 1
+    Description: The priority for the routing rule added to the load balancer.This only applies if your have multiple services which have been assigned to different paths on the load balancer.
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: How many copies of the service task to run
+
+Mappings: 
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    PublicOne:
+      CIDR: '10.0.0.0/24'
+    PublicTwo:
+      CIDR: '10.0.1.0/24'  
+
+Resources: 
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']      
+  
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: 
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: {Ref: 'AWS::Region'}   
+      VpcId: !Ref VPC      
+      CidrBlock: !FindInMap ['SubnetConfig', 'PublicOne', 'CIDR']
+      MapPublicIpOnLaunch: true
+  
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: 
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: {Ref: 'AWS::Region'}   
+      VpcId: !Ref VPC      
+      CidrBlock: !FindInMap ['SubnetConfig', 'PublicTwo', 'CIDR']
+      MapPublicIpOnLaunch: true      
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway 
+  
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment 
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC 
+      
+  PublicRoute:
+    Type: AWS::EC2::Route 
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0' 
+      GatewayId: !Ref InternetGateway  
+
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation 
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable    
+
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation 
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable      
+
+  #############################################################################
+  #                                                                           #
+  #                           Security Groups                                 #
+  #                                                                           #
+  #############################################################################
+  PublicLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load balancer from entire internet range
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+
+  FargateContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Access to fargate containers
+      VpcId: !Ref VPC   
+
+  EcsSecurityGroupIngressFromPublicALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the public ALB 
+      GroupId: !Ref FargateContainerSecurityGroup   
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref PublicLoadBalancerSG
+
+  EcsSecurityGroupIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group 
+      GroupId: !Ref FargateContainerSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref FargateContainerSecurityGroup
+
+  #############################################################################
+  #                                                                           #
+  #                                LB                                         #
+  #                                                                           #
+  #############################################################################
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer 
+    DependsOn: GatewayAttachment
+    Properties:
+      Scheme: internet-facing 
+      LoadBalancerAttributes: 
+        - Key: idle_timeout.timeout_seconds
+          Value: '30'
+      Subnets: 
+        - !Ref PublicSubnetOne 
+        - !Ref PublicSubnetTwo 
+      SecurityGroups: [!Ref 'PublicLoadBalancerSG']      
+      
+  DummyTargetGroupPublic:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: !Join ['-', [!Ref 'AWS::StackName', 'drp']]
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VPC
+
+  PublicLoadBalancerListener: 
+    Type: AWS::ElasticLoadBalancingV2::Listener 
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'DummyTargetGroupPublic'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'PublicLoadBalancer'      
+      Port: 80
+      Protocol: HTTP 
+
+  #############################################################################
+  #                                                                           #
+  #                                ECS                                        #
+  #                                                                           #
+  #############################################################################
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+                - 'logs:CreateLogGroup'
+                - 'logs:DescribeLogStreams'
+
+              Resource: '*'  
+              
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole'] 
+      Policies:
+        - PolicyName: AmazonECSTaskRolePolicy
+          PolicyDocument:
+            Statement: 
+            - Effect: Allow
+              Action:
+                - 'secretsmanager:GetSecretValue'
+              Resource: 'arn:aws:secretsmanager:us-east-1:776688544373:secret:webhooks/secret-2z4TOU'    
+            - Effect: Allow
+              Action: 
+                - 'kms:Decrypt'
+              Resource: '*'               
+       
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition 
+    Properties: 
+      Family: !Ref 'ServiceName'
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: 
+        - FARGATE 
+      ExecutionRoleArn: !GetAtt 'ECSTaskExecutionRole.Arn' 
+      TaskRoleArn: !GetAtt 'ECSTaskRole.Arn'       
+      ContainerDefinitions:
+        - Name: 'proxy'
+          Cpu: !Ref 'ContainerCpu'
+          Memory: !Ref 'ContainerMemory'
+          Image: !Ref 'ProxyImageUrl'
+          PortMappings: 
+            - ContainerPort: !Ref 'ProxyPort' 
+          LogConfiguration:
+            LogDriver: 'awslogs' 
+            Options:
+              awslogs-group: 'webhooks-endpoint'
+              awslogs-region: 'us-east-1'  
+              awslogs-create-group: 'true'
+              awslogs-stream-prefix: 'webhooks-endpoint-nginx'              
+        - Name: 'app'
+          Cpu: !Ref 'ContainerCpu'
+          Memory: !Ref 'ContainerMemory'
+          Image: !Ref 'AppImageUrl'
+          PortMappings: 
+            - ContainerPort: !Ref 'AppPort' 
+          LogConfiguration:
+            LogDriver: 'awslogs'  
+            Options:
+              awslogs-group: 'webhooks-endpoint'
+              awslogs-region: 'us-east-1' 
+              awslogs-create-group: 'true'   
+              awslogs-stream-prefix: 'webhooks-endpoint-app'              
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup 
+    Properties: 
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP 
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: ip 
+      Name: !Ref 'ServiceName'
+      Port: !Ref 'ProxyPort'
+      Protocol: HTTP 
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VPC
+
+  LoadBalancerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref 'TargetGroup'       
+          Type: 'forward'
+      Conditions:
+        - Field: path-pattern
+          Values: [!Ref 'Path']       
+      ListenerArn: !Ref PublicLoadBalancerListener
+      Priority: !Ref 'Priority'            
+
+  Service: 
+    Type: AWS::ECS::Service 
+    DependsOn: LoadBalancerRule 
+    Properties: 
+      ServiceName: !Ref 'ServiceName'
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE 
+      DeploymentConfiguration: 
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: !Ref 'DesiredCount'    
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: 
+            - !Ref FargateContainerSecurityGroup    
+          Subnets:
+            - !Ref PublicSubnetOne                        
+            - !Ref PublicSubnetTwo  
+      TaskDefinition:  !Ref TaskDefinition
+      LoadBalancers:
+        - ContainerName: proxy
+          ContainerPort: !Ref 'ProxyPort'
+          TargetGroupArn: !Ref 'TargetGroup'      
+      
+Outputs:
+  WebhooksEndpoint:
+    Value: !GetAtt PublicLoadBalancer.DNSName
+

@@ -1,0 +1,78 @@
+name: Production
+env:
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
+
+on:
+  # push:
+  #   branches: 
+  #     - main
+  #   paths:
+  #     - 'app/**'
+  #     - 'aws/**'
+  #     - 'nginx/**'
+  workflow_dispatch:
+        
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-20.04
+    if: github.ref == 'refs/heads/main'
+    name: Build and publish
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v2  
+
+      - name: setup go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '1.16' 
+          
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}    
+          
+      - name: create docker image tag
+        id: dockerImageTag
+        run: echo "::set-output name=tag::$(date +'%Y%m%d%H%M%S')-${GITHUB_SHA}"    
+
+      - name: publish docker image to ecr registry
+        env:
+          DOCKER_IMAGE_TAG: ${{ steps.dockerImageTag.outputs.tag }}
+        working-directory: application  
+        run: |
+          docker build -t webhooks-endpoint-app .
+          docker tag webhooks-endpoint-app ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-app:${DOCKER_IMAGE_TAG}
+          docker tag webhooks-endpoint-app ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-app:latest
+          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+          docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-app:${DOCKER_IMAGE_TAG}
+          docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-app:latest   
+
+      - name: publish docker image to ecr registry
+        env:
+          DOCKER_IMAGE_TAG: ${{ steps.dockerImageTag.outputs.tag }}
+        working-directory: nginx 
+        run: |
+          docker build -t webhooks-endpoint-nginx .
+          docker tag webhooks-endpoint-nginx ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-nginx:${DOCKER_IMAGE_TAG}
+          docker tag webhooks-endpoint-nginx ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-nginx:latest
+          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+          docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-nginx:${DOCKER_IMAGE_TAG}
+          docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-nginx:latest  
+
+      - name: Deploy
+        env:
+          DOCKER_IMAGE_TAG: ${{ steps.dockerImageTag.outputs.tag }}
+        working-directory: aws  
+        run: |    
+          aws cloudformation package --template-file ./template.yml \
+          --s3-bucket "${BUCKET_NAME}" --output-template-file ./.template.yml
+          aws cloudformation deploy --template-file ./.template.yml \
+          --stack-name webhooks-endpoint-Production --capabilities CAPABILITY_IAM \
+          --parameter-overrides "AppImageUrl=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-app:${DOCKER_IMAGE_TAG}" \
+          "ProxyImageUrl=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/webhooks-endpoint-nginx:${DOCKER_IMAGE_TAG}"
